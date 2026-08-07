@@ -32,16 +32,23 @@ func MakeLock(ck kvtest.IKVClerk, lockname string) *Lock {
 }
 
 func (lk *Lock) Acquire() {
+	putString := kvtest.RandValue(8)
 	for {
 		value, version, _ := lk.ck.Get(lk.name)
 		if value == "" {
 			err := lk.ck.Put(
 				lk.name,
-				kvtest.RandValue(8),
+				putString,
 				version,
 			)
 			if err == rpc.OK {
 				break
+			}
+			if err == rpc.ErrMaybe {
+				value1, _, _ := lk.ck.Get(lk.name)
+				if value1 == putString {
+					break
+				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
