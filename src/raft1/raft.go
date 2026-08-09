@@ -46,7 +46,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	term = rf.currentTerm
-	isleader = (rf.leader == rf.me)
+	isleader = (rf.idenity == "leader")
 	// Your code here (3A).
 	return term, isleader
 }
@@ -114,7 +114,7 @@ type RequestVoteArgs struct {
 }
 type AppendEntriesArgs struct {
 	Term     int
-	LeaderId int
+	LeaderID int
 	//PrevLogIndex int
 	//PrevLogTerm  int
 	//Entries      []LogEntry
@@ -129,9 +129,8 @@ type RequestVoteReply struct {
 	Term   int
 }
 type AppendEntriesReply struct {
-	AddEntries bool
-	Term       int
-	LeaderID   int
+	Term     int
+	LeaderID int
 }
 
 // example RequestVote RPC handler.
@@ -164,13 +163,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = args.Term
+	reply.LeaderID = rf.leader
 	if args.Term < rf.currentTerm {
-		reply.AddEntries = false
 		reply.Term = rf.currentTerm
 		reply.LeaderID = rf.leader
 	}
-	if args.Term == rf.currentTerm {
-		reply.AddEntries = true
+	if args.Term >= rf.currentTerm {
+		rf.leader = args.LeaderID
+		rf.lastContact = time.Now()
+		if args.Term > rf.currentTerm {
+			rf.voteID = -1
+		}
+		rf.currentTerm = args.Term
+		rf.idenity = "follower"
+		rf.electionTimeout = time.Duration(400+rand.Intn(300)) * time.Millisecond
 	}
 }
 
@@ -233,7 +243,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) ticker() {
 	for {
-		ms := 50 + rand.Int63()%300
+		ms := 10
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		rf.mu.Lock()
@@ -247,7 +257,7 @@ func (rf *Raft) ticker() {
 			rf.idenity = "candidate"
 			rf.leader = -1
 			rf.lastContact = time.Now()
-
+			rf.electionTimeout = time.Duration(rand.Intn(400)+300) * time.Millisecond
 			term := rf.currentTerm
 			me := rf.me
 			length := len(rf.peers)
@@ -261,49 +271,54 @@ func (rf *Raft) ticker() {
 
 			informed := make([]int, 0)
 			higherTerm := term
-
+			//resultCh := make(chan voteResult, length-1)
+			//requestCount := 0
 			for i := 0; i < length; i++ {
 				if i == me {
 					continue
 				}
 
 				reply := RequestVoteReply{}
-				ok := rf.sendRequestVote(
-					i,
-					&requestVoteArgs,
-					&reply,
-				)
+				//requestCount++
+				go func(i int) {
+					ok := rf.sendRequestVote(
+						i,
+						&requestVoteArgs,
+						&reply,
+					)
 
-				if ok {
+					if !ok {
+						return
+					}
+					rf.mu.Lock()
 					if reply.Term > higherTerm {
 						higherTerm = reply.Term
 					}
 
 					if reply.Term == term &&
 						reply.Leader == me {
-						informed = append(informed, i)
+						informed = append(informed, me)
 					}
-				}
+
+					if higherTerm > rf.currentTerm {
+						rf.currentTerm = higherTerm
+						rf.idenity = "follower"
+						rf.leader = -1
+						rf.voteID = -1
+						rf.lastContact = time.Now()
+						rf.mu.Unlock()
+						return
+					} else if rf.currentTerm == term &&
+						rf.idenity == "candidate" &&
+						len(informed) >= length/2 {
+
+						rf.leader = rf.me
+						rf.idenity = "leader"
+					}
+
+					rf.mu.Unlock()
+				}(i)
 			}
-
-			rf.mu.Lock()
-
-			if higherTerm > rf.currentTerm {
-				rf.currentTerm = higherTerm
-				rf.idenity = "follower"
-				rf.leader = -1
-				rf.voteID = -1
-				rf.lastContact = time.Now()
-
-			} else if rf.currentTerm == term &&
-				rf.idenity == "candidate" &&
-				len(informed) >= length/2 {
-
-				rf.leader = rf.me
-				rf.idenity = "leader"
-			}
-
-			rf.mu.Unlock()
 		} else {
 			rf.mu.Unlock()
 		}
@@ -311,25 +326,43 @@ func (rf *Raft) ticker() {
 }
 func (rf *Raft) heartbeat() {
 	for true {
-		time.Sleep(time.Duration(500) * time.Millisecond)
+		time.Sleep(time.Duration(100) * time.Millisecond)
 		rf.mu.Lock()
-		if rf.leader == rf.me {
+		AppendEntriesArgs1 := AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderID: rf.me,
+		}
+		term := rf.currentTerm
+		idenity := rf.idenity
+		rf.mu.Unlock()
+		higherTerm := term
+		if idenity == "leader" {
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
-					AppendEntriesArgs1 := AppendEntriesArgs{
-						Term:     rf.currentTerm,
-						LeaderId: rf.me,
-					}
 					AppendEntriesReply1 := AppendEntriesReply{}
-					rf.sendAppendEntries(i, &AppendEntriesArgs1, &AppendEntriesReply1)
-					if AppendEntriesReply1.AddEntries == false {
-						rf.leader = AppendEntriesReply1.LeaderID
-						rf.currentTerm = AppendEntriesReply1.Term
-					}
+					go func(i int) {
+						ok := rf.sendAppendEntries(i, &AppendEntriesArgs1, &AppendEntriesReply1)
+						if !ok {
+							return
+						}
+						rf.mu.Lock()
+						if AppendEntriesReply1.Term > higherTerm {
+							higherTerm = AppendEntriesReply1.Term
+						}
+
+						if higherTerm > rf.currentTerm {
+							rf.currentTerm = higherTerm
+							rf.idenity = "follower"
+							rf.leader = -1
+							rf.voteID = -1
+							rf.lastContact = time.Now()
+						}
+						rf.mu.Unlock()
+
+					}(i)
 				}
 			}
 		}
-		rf.mu.Unlock()
 	}
 }
 
@@ -352,7 +385,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.lastContact = time.Now()
 	rf.idenity = "follower"
-	rf.electionTimeout = time.Duration(rand.Intn(300)) * time.Millisecond
+	rf.voteID = -1
+	rf.electionTimeout = time.Duration(400+rand.Intn(300)) * time.Millisecond
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
@@ -360,7 +394,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	//go rf.heartbeat()
+	go rf.heartbeat()
 
 	return rf
 }
